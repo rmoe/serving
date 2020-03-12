@@ -16,6 +16,7 @@ package handler
 import (
 	"net/http"
 
+	pkghttp "knative.dev/serving/pkg/http"
 	"k8s.io/apimachinery/pkg/types"
 	"knative.dev/serving/pkg/activator/util"
 )
@@ -55,10 +56,13 @@ type RequestEventHandler struct {
 
 func (h *RequestEventHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	revisionKey := util.RevIDFrom(r.Context())
+	recorder := pkghttp.NewResponseRecorder(w, http.StatusOK)
 
 	h.ReqChan <- ReqEvent{Key: revisionKey, EventType: ReqIn}
 	defer func() {
-		h.ReqChan <- ReqEvent{Key: revisionKey, EventType: ReqOut}
+		if recorder.ResponseCode != 202 {
+			h.ReqChan <- ReqEvent{Key: revisionKey, EventType: ReqOut}
+		}
 	}()
-	h.nextHandler.ServeHTTP(w, r)
+	h.nextHandler.ServeHTTP(recorder, r)
 }

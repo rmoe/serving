@@ -82,6 +82,7 @@ func (a *activationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Host:   dest,
 		}, tracingEnabled)
 		proxySpan.End()
+		//w.WriteHeader(httpStatus)
 
 		return nil
 	}); err != nil {

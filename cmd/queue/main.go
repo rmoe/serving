@@ -25,11 +25,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
@@ -80,12 +82,14 @@ const (
 	aggressivePollInterval = 25 * time.Millisecond
 	// reportingPeriod is the interval of time between reporting stats by queue proxy.
 	reportingPeriod = 1 * time.Second
+
 )
 
 var (
 	logger *zap.SugaredLogger
 
 	readinessProbeTimeout = flag.Int("probe-period", -1, "run readiness probe with given timeout")
+	activeAsyncWG = sync.WaitGroup{}
 )
 
 type config struct {
@@ -147,16 +151,34 @@ func proxyHandler(reqChan chan queue.ReqEvent, breaker *queue.Breaker, tracingEn
 		if activator.Name == network.KnativeProxyHeader(r) {
 			in, out = queue.ProxiedIn, queue.ProxiedOut
 		}
+
+		var isAsync bool
+		asyncHeader := r.Header.Get("Async-Request")
+		if asyncHeader != "" {
+			isAsync, _ = strconv.ParseBool(asyncHeader)
+			/*if err != nil {
+				http.Error(w, "invalid async value", http.StatusBadRequest)
+				return
+			}*/
+		}
+
+		asyncChan := make(chan struct{})
+
 		reqChan <- queue.ReqEvent{Time: time.Now(), EventType: in}
 		defer func() {
-			reqChan <- queue.ReqEvent{Time: time.Now(), EventType: out}
+			go func() {
+				if isAsync {
+					<-asyncChan
+				}
+			  reqChan <- queue.ReqEvent{Time: time.Now(), EventType: out}
+			}()
 		}()
 		network.RewriteHostOut(r)
 
 		// Enforce queuing and concurrency limits.
 		if breaker != nil {
 			if err := breaker.Maybe(r.Context(), func() {
-				next.ServeHTTP(w, r)
+			  handleRequest(next, w, r, isAsync, asyncChan)
 			}); err != nil {
 				switch err {
 				case context.DeadlineExceeded, queue.ErrRequestQueueFull:
@@ -166,16 +188,37 @@ func proxyHandler(reqChan chan queue.ReqEvent, breaker *queue.Breaker, tracingEn
 				}
 			}
 		} else {
-			next.ServeHTTP(w, r)
+		  handleRequest(next, w, r, isAsync, asyncChan)
 		}
 	}
+}
+
+func handleRequest(handler http.Handler, w http.ResponseWriter, r *http.Request, isAsync bool, asyncChan chan struct{}) {
+	if !isAsync {
+		handler.ServeHTTP(w, r)
+		return
+	}
+
+	go func() {
+		activeAsyncWG.Add(1)
+
+		resp := httptest.NewRecorder()
+		rr := r.WithContext(context.Background())
+		defer func() {
+			close(asyncChan)
+			activeAsyncWG.Done()
+		}()
+
+		handler.ServeHTTP(resp, rr)
+	}()
+
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func preferPodForScaledown(downwardAPILabelsPath string) (bool, error) {
 	// Short circuit a rejection when no label path file is mounted
 	if _, err := os.Stat(downwardAPILabelsPath); os.IsNotExist(err) {
 		return false, nil
-	}
 
 	contentBytes, err := ioutil.ReadFile(downwardAPILabelsPath)
 	if err != nil {
