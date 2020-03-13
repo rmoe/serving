@@ -31,7 +31,7 @@ import (
 	"knative.dev/serving/pkg/activator"
 	activatorconfig "knative.dev/serving/pkg/activator/config"
 	activatornet "knative.dev/serving/pkg/activator/net"
-	"knative.dev/serving/pkg/activator/util"
+	//"knative.dev/serving/pkg/activator/util"
 	"knative.dev/serving/pkg/network"
 	"knative.dev/serving/pkg/queue"
 )
@@ -114,7 +114,7 @@ func (a *activationHandler) proxyRequest(logger *zap.SugaredLogger, w http.Respo
 	}
 	proxy.FlushInterval = -1
 	proxy.ErrorHandler = pkgnet.ErrorHandler(logger)
-	util.SetupHeaderPruning(proxy)
+	//util.SetupHeaderPruning(proxy)
 
 	proxy.ServeHTTP(w, r)
 }

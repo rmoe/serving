@@ -46,6 +46,7 @@ import (
 	pkglogging "knative.dev/pkg/logging"
 	"knative.dev/pkg/logging/logkey"
 	"knative.dev/pkg/metrics"
+	"knative.dev/pkg/system"
 	pkgnet "knative.dev/pkg/network"
 	"knative.dev/pkg/profiling"
 	"knative.dev/pkg/signals"
@@ -90,6 +91,8 @@ var (
 
 	readinessProbeTimeout = flag.Int("probe-period", -1, "run readiness probe with given timeout")
 	activeAsyncWG = sync.WaitGroup{}
+  activatorSvc = fmt.Sprintf("http://%s.%s.svc.%s", "activator-service", system.Namespace(), pkgnet.GetClusterDomainName())
+	//activatorSvc = "http://172.21.186.217"
 )
 
 type config struct {
@@ -169,6 +172,15 @@ func proxyHandler(reqChan chan queue.ReqEvent, breaker *queue.Breaker, tracingEn
 			go func() {
 				if isAsync {
 					<-asyncChan
+
+					client := &http.Client{}
+					req, _ := http.NewRequest("GET", activatorSvc, nil)
+					req.Header = r.Header
+					req.Header.Set("Async-Done", "true")
+					_, err := client.Do(req)
+					if err != nil {
+						fmt.Errorf("Failed to update activator %v\n\n", err)
+					}
 				}
 			  reqChan <- queue.ReqEvent{Time: time.Now(), EventType: out}
 			}()
@@ -219,6 +231,7 @@ func preferPodForScaledown(downwardAPILabelsPath string) (bool, error) {
 	// Short circuit a rejection when no label path file is mounted
 	if _, err := os.Stat(downwardAPILabelsPath); os.IsNotExist(err) {
 		return false, nil
+	}
 
 	contentBytes, err := ioutil.ReadFile(downwardAPILabelsPath)
 	if err != nil {
