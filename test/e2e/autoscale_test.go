@@ -72,7 +72,7 @@ type testContext struct {
 	metric            string
 }
 
-func getVegetaTarget(kubeClientset *kubernetes.Clientset, domain, endpointOverride string, resolvable bool) (vegeta.Target, error) {
+func getVegetaTarget(kubeClientset *kubernetes.Clientset, domain, endpointOverride string, resolvable bool, async bool) (vegeta.Target, error) {
 	if resolvable {
 		return vegeta.Target{
 			Method: http.MethodGet,
@@ -93,6 +93,9 @@ func getVegetaTarget(kubeClientset *kubernetes.Clientset, domain, endpointOverri
 
 	h := http.Header{}
 	h.Set("Host", domain)
+	if async {
+		h.Set("Async-Request", "true")
+	}
 	return vegeta.Target{
 		Method: http.MethodGet,
 		URL:    fmt.Sprintf("http://%s?sleep=%d", endpoint, autoscaleSleep),
@@ -105,10 +108,11 @@ func generateTraffic(
 	attacker *vegeta.Attacker,
 	pacer vegeta.Pacer,
 	duration time.Duration,
-	stopChan chan struct{}) error {
+	stopChan chan struct{},
+	async bool) error {
 
 	target, err := getVegetaTarget(
-		ctx.clients.KubeClient.Kube, ctx.resources.Route.Status.URL.URL().Hostname(), pkgTest.Flags.IngressEndpoint, test.ServingFlags.ResolvableDomain)
+		ctx.clients.KubeClient.Kube, ctx.resources.Route.Status.URL.URL().Hostname(), pkgTest.Flags.IngressEndpoint, test.ServingFlags.ResolvableDomain, async)
 	if err != nil {
 		return fmt.Errorf("error creating vegeta target: %w", err)
 	}
@@ -140,8 +144,8 @@ func generateTraffic(
 			}
 
 			totalRequests++
-			if res.Code != http.StatusOK {
-				ctx.t.Logf("Status = %d, want: 200", res.Code)
+			if res.Code != http.StatusOK && res.Code != http.StatusAccepted {
+				ctx.t.Logf("Status = %d, want: 200 or 202", res.Code)
 				ctx.t.Logf("URL: %s Duration: %v Body:\n%s", res.URL, res.Latency, string(res.Body))
 				continue
 			}
@@ -150,20 +154,28 @@ func generateTraffic(
 	}
 }
 
+func generateAsyncTrafficAtFixedConcurrency(ctx *testContext, concurrency int, duration time.Duration, stopChan chan struct{}) error {
+	pacer := vegeta.ConstantPacer{Freq: concurrency, Per: time.Second} // Sends requests as quickly as possible, capped by MaxWorkers below.
+	attacker := vegeta.NewAttacker(vegeta.Timeout(duration), vegeta.Workers(uint64(concurrency)), vegeta.MaxWorkers(uint64(concurrency)))
+
+	ctx.t.Logf("Maintaining %d concurrent requests for %v.", concurrency, duration)
+	return generateTraffic(ctx, attacker, pacer, duration, stopChan, true)
+}
+
 func generateTrafficAtFixedConcurrency(ctx *testContext, concurrency int, duration time.Duration, stopChan chan struct{}) error {
 	pacer := vegeta.ConstantPacer{} // Sends requests as quickly as possible, capped by MaxWorkers below.
 	attacker := vegeta.NewAttacker(vegeta.Timeout(duration), vegeta.Workers(uint64(concurrency)), vegeta.MaxWorkers(uint64(concurrency)))
 
 	ctx.t.Logf("Maintaining %d concurrent requests for %v.", concurrency, duration)
-	return generateTraffic(ctx, attacker, pacer, duration, stopChan)
+	return generateTraffic(ctx, attacker, pacer, duration, stopChan, false)
 }
 
-func generateTrafficAtFixedRPS(ctx *testContext, rps int, duration time.Duration, stopChan chan struct{}) error {
+func generateTrafficAtFixedRPS(ctx *testContext, rps int, duration time.Duration, stopChan chan struct{}, async bool) error {
 	pacer := vegeta.ConstantPacer{Freq: rps, Per: time.Second}
 	attacker := vegeta.NewAttacker(vegeta.Timeout(duration))
 
 	ctx.t.Logf("Maintaining %v RPS requests for %v.", rps, duration)
-	return generateTraffic(ctx, attacker, pacer, duration, stopChan)
+	return generateTraffic(ctx, attacker, pacer, duration, stopChan, async)
 }
 
 type validationFunc func(*testing.T, *test.Clients, test.ResourceNames) error
@@ -354,7 +366,7 @@ func checkPodScale(ctx *testContext, targetPods, minPods, maxPods float64, durat
 	}
 }
 
-func assertAutoscaleUpToNumPods(ctx *testContext, curPods, targetPods float64, duration time.Duration, quick bool) {
+func assertAutoscaleUpToNumPods(ctx *testContext, curPods, targetPods float64, duration time.Duration, quick bool, async bool) {
 	ctx.t.Helper()
 	// There are two test modes: quick, and not quick.
 	// 1) Quick mode: succeeds when the number of pods meets targetPods.
@@ -372,9 +384,9 @@ func assertAutoscaleUpToNumPods(ctx *testContext, curPods, targetPods float64, d
 	grp.Go(func() error {
 		switch ctx.metric {
 		case autoscaling.RPS:
-			return generateTrafficAtFixedRPS(ctx, int(targetPods*float64(ctx.targetValue)), duration, stopChan)
+			return generateTrafficAtFixedRPS(ctx, int(targetPods*float64(ctx.targetValue)), duration, stopChan, async)
 		default:
-			return generateTrafficAtFixedConcurrency(ctx, int(targetPods*float64(ctx.targetValue)), duration, stopChan)
+			return generateAsyncTrafficAtFixedConcurrency(ctx, int(targetPods*float64(ctx.targetValue)), duration, stopChan)
 		}
 	})
 
@@ -471,9 +483,14 @@ func TestAutoscaleUpDownUp(t *testing.T) {
 	ctx := setup(t, autoscaling.KPA, autoscaling.Concurrency, containerConcurrency, targetUtilization, autoscaleTestImageName, validateEndpoint)
 	defer test.TearDown(ctx.clients, ctx.names)
 
-	assertAutoscaleUpToNumPods(ctx, 1, 2, 60*time.Second, true)
+	t.Run("async", func(tt *testing.T) {
+		assertAutoscaleUpToNumPods(ctx, 1, 2, 60*time.Second, true, true)
+	})
 	assertScaleDown(ctx)
-	assertAutoscaleUpToNumPods(ctx, 0, 2, 60*time.Second, true)
+	t.Run("sync", func(tt *testing.T) {
+		assertAutoscaleUpToNumPods(ctx, 0, 2, 60*time.Second, true, false)
+	})
+	assertScaleDown(ctx)
 }
 
 func TestAutoscaleUpCountPods(t *testing.T) {
@@ -500,11 +517,17 @@ func TestAutoscaleUpCountPods(t *testing.T) {
 			// Increase workload for 2 replicas for 60s
 			// Assert the number of expected replicas is between n-1 and n+1, where n is the # of desired replicas for 60s.
 			// Assert the number of expected replicas is n and n+1 at the end of 60s, where n is the # of desired replicas.
-			assertAutoscaleUpToNumPods(ctx, 1, 2, 60*time.Second, true)
-			// Increase workload scale to 3 replicas, assert between [n-1, n+1] during scale up, assert between [n, n+1] after scaleup.
-			assertAutoscaleUpToNumPods(ctx, 2, 3, 60*time.Second, true)
-			// Increase workload scale to 4 replicas, assert between [n-1, n+1] during scale up, assert between [n, n+1] after scaleup.
-			assertAutoscaleUpToNumPods(ctx, 3, 4, 60*time.Second, true)
+			for name, async := range map[string]bool{"async": true, "sync": false} {
+				tt.Run(name, func(ttt *testing.T) {
+					ttt.Parallel()
+					assertAutoscaleUpToNumPods(ctx, 1, 2, 60*time.Second, true, async)
+					// Increase workload scale to 3 replicas, assert between [n-1, n+1] during scale up, assert between [n, n+1] after scaleup.
+					assertAutoscaleUpToNumPods(ctx, 2, 3, 60*time.Second, true, async)
+					// Increase workload scale to 4 replicas, assert between [n-1, n+1] during scale up, assert between [n, n+1] after scaleup.
+					assertAutoscaleUpToNumPods(ctx, 3, 4, 60*time.Second, true, async)
+				})
+				assertScaleDown(ctx)
+			}
 		})
 	}
 }
@@ -533,11 +556,11 @@ func TestRPSBasedAutoscaleUpCountPods(t *testing.T) {
 			// Increase workload for 2 replicas for 60s
 			// Assert the number of expected replicas is between n-1 and n+1, where n is the # of desired replicas for 60s.
 			// Assert the number of expected replicas is n and n+1 at the end of 60s, where n is the # of desired replicas.
-			assertAutoscaleUpToNumPods(ctx, 1, 2, 60*time.Second, true)
+			assertAutoscaleUpToNumPods(ctx, 1, 2, 60*time.Second, true, false)
 			// Increase workload scale to 3 replicas, assert between [n-1, n+1] during scale up, assert between [n, n+1] after scaleup.
-			assertAutoscaleUpToNumPods(ctx, 2, 3, 60*time.Second, true)
+			assertAutoscaleUpToNumPods(ctx, 2, 3, 60*time.Second, true, false)
 			// Increase workload scale to 4 replicas, assert between [n-1, n+1] during scale up, assert between [n, n+1] after scaleup.
-			assertAutoscaleUpToNumPods(ctx, 3, 4, 60*time.Second, true)
+			assertAutoscaleUpToNumPods(ctx, 3, 4, 60*time.Second, true, false)
 		})
 	}
 }
@@ -553,7 +576,14 @@ func TestAutoscaleSustaining(t *testing.T) {
 	ctx := setup(t, autoscaling.KPA, autoscaling.Concurrency, containerConcurrency, targetUtilization, autoscaleTestImageName, validateEndpoint)
 	defer test.TearDown(ctx.clients, ctx.names)
 
-	assertAutoscaleUpToNumPods(ctx, 1, 10, 2*time.Minute, false)
+	t.Run("sync", func(tt *testing.T) {
+		assertAutoscaleUpToNumPods(ctx, 1, 10, 2*time.Minute, false, false)
+	})
+	assertScaleDown(ctx)
+	t.Run("async", func(tt *testing.T) {
+		assertAutoscaleUpToNumPods(ctx, 1, 10, 2*time.Minute, false, true)
+	})
+	assertScaleDown(ctx)
 }
 
 func TestTargetBurstCapacity(t *testing.T) {

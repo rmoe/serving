@@ -24,12 +24,14 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
@@ -47,6 +49,7 @@ import (
 	pkgnet "knative.dev/pkg/network"
 	"knative.dev/pkg/profiling"
 	"knative.dev/pkg/signals"
+	"knative.dev/pkg/system"
 	"knative.dev/pkg/tracing"
 	tracingconfig "knative.dev/pkg/tracing/config"
 	"knative.dev/serving/pkg/activator"
@@ -86,6 +89,8 @@ var (
 	logger *zap.SugaredLogger
 
 	readinessProbeTimeout = flag.Int("probe-period", -1, "run readiness probe with given timeout")
+	activeAsyncWG         = sync.WaitGroup{}
+	activatorSvc          = fmt.Sprintf("http://%s.%s.svc.%s", "activator-service", system.Namespace(), pkgnet.GetClusterDomainName())
 )
 
 type config struct {
@@ -147,16 +152,34 @@ func proxyHandler(reqChan chan queue.ReqEvent, breaker *queue.Breaker, tracingEn
 		if activator.Name == network.KnativeProxyHeader(r) {
 			in, out = queue.ProxiedIn, queue.ProxiedOut
 		}
+
+		var isAsync bool
+		asyncHeader := r.Header.Get("Async-Request")
+		if asyncHeader != "" {
+			isAsync, _ = strconv.ParseBool(asyncHeader)
+			/*if err != nil {
+				fmt.Errorf("Invalid Async-Request header value %v: %v", isAsync, err)
+				return
+			}*/
+		}
+
+		asyncChan := make(chan struct{})
+
 		reqChan <- queue.ReqEvent{Time: time.Now(), EventType: in}
 		defer func() {
-			reqChan <- queue.ReqEvent{Time: time.Now(), EventType: out}
+			go func() {
+				if isAsync {
+					<-asyncChan
+				}
+				reqChan <- queue.ReqEvent{Time: time.Now(), EventType: out}
+			}()
 		}()
 		network.RewriteHostOut(r)
 
 		// Enforce queuing and concurrency limits.
 		if breaker != nil {
 			if err := breaker.Maybe(r.Context(), func() {
-				next.ServeHTTP(w, r)
+				handleRequest(next, w, r, isAsync, asyncChan)
 			}); err != nil {
 				switch err {
 				case context.DeadlineExceeded, queue.ErrRequestQueueFull:
@@ -166,9 +189,31 @@ func proxyHandler(reqChan chan queue.ReqEvent, breaker *queue.Breaker, tracingEn
 				}
 			}
 		} else {
-			next.ServeHTTP(w, r)
+			handleRequest(next, w, r, isAsync, asyncChan)
 		}
 	}
+}
+
+func handleRequest(handler http.Handler, w http.ResponseWriter, r *http.Request, isAsync bool, asyncChan chan struct{}) {
+	if !isAsync {
+		handler.ServeHTTP(w, r)
+		return
+	}
+
+	go func() {
+		activeAsyncWG.Add(1)
+
+		resp := httptest.NewRecorder()
+		rr := r.WithContext(context.Background())
+		defer func() {
+			close(asyncChan)
+			activeAsyncWG.Done()
+		}()
+
+		handler.ServeHTTP(resp, rr)
+	}()
+
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func preferPodForScaledown(downwardAPILabelsPath string) (bool, error) {

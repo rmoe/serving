@@ -44,7 +44,8 @@ type ConcurrencyReporter struct {
 	// Ticks with every request arrived/completed respectively
 	reqCh chan ReqEvent
 	// Stat reporting channel
-	statCh chan []asmetrics.StatMessage
+	statCh   chan []asmetrics.StatMessage
+	asStatCh chan []asmetrics.StatMessage
 
 	rl servinglisters.RevisionLister
 }
@@ -52,13 +53,14 @@ type ConcurrencyReporter struct {
 // NewConcurrencyReporter creates a ConcurrencyReporter which listens to incoming
 // ReqEvents on reqCh and ticks on reportCh and reports stats on statCh.
 func NewConcurrencyReporter(ctx context.Context, podName string,
-	reqCh chan ReqEvent, statCh chan []asmetrics.StatMessage) *ConcurrencyReporter {
+	reqCh chan ReqEvent, statCh chan []asmetrics.StatMessage, asStatCh chan []asmetrics.StatMessage) *ConcurrencyReporter {
 	return &ConcurrencyReporter{
-		logger:  logging.FromContext(ctx),
-		podName: podName,
-		reqCh:   reqCh,
-		statCh:  statCh,
-		rl:      revisioninformer.Get(ctx).Lister(),
+		logger:   logging.FromContext(ctx),
+		podName:  podName,
+		reqCh:    reqCh,
+		statCh:   statCh,
+		asStatCh: asStatCh,
+		rl:       revisioninformer.Get(ctx).Lister(),
 	}
 }
 
@@ -96,6 +98,20 @@ func (cr *ConcurrencyReporter) run(stopCh <-chan struct{}, reportCh <-chan time.
 	// This is important because for small concurrencies, e.g. 1,
 	// autoscaler might cause noticeable overprovisioning.
 	reportedFirstRequest := make(map[types.NamespacedName]float64)
+
+	go func() {
+		for {
+			select {
+			case msgs := <-cr.asStatCh:
+				for _, msg := range msgs {
+					if time.Now().Sub(msg.Stat.Time) < 30*time.Second && msg.Stat.AverageConcurrentRequests != outstandingRequestsPerKey[msg.Key] {
+						cr.logger.Debugf("Setting outstandingRequestsPerKey for key %v to (%v) instaed of", msg.Key, msg.Stat.AverageConcurrentRequests, outstandingRequestsPerKey[msg.Key])
+						outstandingRequestsPerKey[msg.Key] = msg.Stat.AverageConcurrentRequests
+					}
+				}
+			}
+		}
+	}()
 
 	for {
 		select {

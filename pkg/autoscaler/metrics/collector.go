@@ -109,6 +109,7 @@ type MetricCollector struct {
 
 	statsScraperFactory StatsScraperFactory
 	tickProvider        func(time.Duration) *time.Ticker
+	statCh              chan StatMessage
 
 	collections      map[types.NamespacedName]*collection
 	collectionsMutex sync.RWMutex
@@ -118,11 +119,12 @@ var _ Collector = (*MetricCollector)(nil)
 var _ MetricClient = (*MetricCollector)(nil)
 
 // NewMetricCollector creates a new metric collector.
-func NewMetricCollector(statsScraperFactory StatsScraperFactory, logger *zap.SugaredLogger) *MetricCollector {
+func NewMetricCollector(statsScraperFactory StatsScraperFactory, statCh chan StatMessage, logger *zap.SugaredLogger) *MetricCollector {
 	return &MetricCollector{
 		logger:              logger,
 		collections:         make(map[types.NamespacedName]*collection),
 		statsScraperFactory: statsScraperFactory,
+		statCh:              statCh,
 		tickProvider:        time.NewTicker,
 	}
 }
@@ -156,7 +158,7 @@ func (c *MetricCollector) CreateOrUpdate(metric *av1alpha1.Metric) error {
 		return nil
 	}
 
-	c.collections[key] = newCollection(metric, scraper, c.tickProvider, c.logger)
+	c.collections[key] = newCollection(metric, scraper, c.tickProvider, c.statCh, c.logger)
 	return nil
 }
 
@@ -195,7 +197,7 @@ func (c *MetricCollector) StableAndPanicConcurrency(key types.NamespacedName, no
 	}
 
 	s, p, noData := collection.stableAndPanicConcurrency(now)
-	if noData && collection.currentMetric().Spec.ScrapeTarget != "" {
+	if noData { //&& collection.currentMetric().Spec.ScrapeTarget != "" {
 		return 0, 0, ErrNoData
 	}
 	return s, p, nil
@@ -213,7 +215,7 @@ func (c *MetricCollector) StableAndPanicRPS(key types.NamespacedName, now time.T
 	}
 
 	s, p, noData := collection.stableAndPanicRPS(now)
-	if noData && collection.currentMetric().Spec.ScrapeTarget != "" {
+	if noData { //&& collection.currentMetric().Spec.ScrapeTarget != "" {
 		return 0, 0, ErrNoData
 	}
 	return s, p, nil
@@ -232,6 +234,7 @@ type collection struct {
 	rpsPanicBuckets         *aggregation.TimedFloat64Buckets
 
 	grp    sync.WaitGroup
+	statCh chan StatMessage
 	stopCh chan struct{}
 }
 
@@ -249,7 +252,7 @@ func (c *collection) getScraper() StatsScraper {
 
 // newCollection creates a new collection, which uses the given scraper to
 // collect stats every scrapeTickInterval.
-func newCollection(metric *av1alpha1.Metric, scraper StatsScraper, tickFactory func(time.Duration) *time.Ticker, logger *zap.SugaredLogger) *collection {
+func newCollection(metric *av1alpha1.Metric, scraper StatsScraper, tickFactory func(time.Duration) *time.Ticker, statCh chan StatMessage, logger *zap.SugaredLogger) *collection {
 	c := &collection{
 		metric: metric,
 		concurrencyBuckets: aggregation.NewTimedFloat64Buckets(
@@ -261,10 +264,12 @@ func newCollection(metric *av1alpha1.Metric, scraper StatsScraper, tickFactory f
 		rpsPanicBuckets: aggregation.NewTimedFloat64Buckets(
 			metric.Spec.PanicWindow, config.BucketSize),
 		scraper: scraper,
+		statCh:  statCh,
 
 		stopCh: make(chan struct{}),
 	}
 
+	key := types.NamespacedName{Namespace: metric.Namespace, Name: metric.Name}
 	logger = logger.Named("collector").With(
 		zap.String(logkey.Key, fmt.Sprintf("%s/%s", metric.Namespace, metric.Name)))
 
@@ -300,6 +305,12 @@ func newCollection(metric *av1alpha1.Metric, scraper StatsScraper, tickFactory f
 				}
 				if stat != emptyStat {
 					c.record(stat)
+
+					select {
+					case c.statCh <- StatMessage{Key: key, Stat: stat}:
+						logger.Infof("Sending stat message with key (%v) to stat server: %+v\n\nLen msg chan: %v", key, stat, len(c.statCh))
+					default:
+					}
 				}
 			}
 		}

@@ -39,18 +39,20 @@ type Server struct {
 	wsSrv       http.Server
 	servingCh   chan struct{}
 	stopCh      chan struct{}
-	statsCh     chan<- metrics.StatMessage
+	statsCh     chan metrics.StatMessage
+	actStatsCh  chan metrics.StatMessage
 	openClients sync.WaitGroup
 	logger      *zap.SugaredLogger
 }
 
 // New creates a Server which will receive autoscaler statistics and forward them to statsCh until Shutdown is called.
-func New(statsServerAddr string, statsCh chan<- metrics.StatMessage, logger *zap.SugaredLogger) *Server {
+func New(statsServerAddr string, statsCh, actStatsCh chan metrics.StatMessage, logger *zap.SugaredLogger) *Server {
 	svr := Server{
 		addr:        statsServerAddr,
 		servingCh:   make(chan struct{}),
 		stopCh:      make(chan struct{}),
 		statsCh:     statsCh,
+		actStatsCh:  actStatsCh,
 		openClients: sync.WaitGroup{},
 		logger:      logger.Named("stats-websocket-server").With("address", statsServerAddr),
 	}
@@ -169,6 +171,25 @@ func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 
 		s.logger.Debugf("Received stat message: %+v", sm)
 		s.statsCh <- sm
+
+		select {
+		case <-s.actStatsCh:
+			msgLen := len(s.actStatsCh)
+			var messages []metrics.StatMessage
+			for i := 0; i <= msgLen; i++ {
+				messages = append(messages, <-s.actStatsCh)
+			}
+			var message bytes.Buffer
+			enc := gob.NewEncoder(&message)
+			err = enc.Encode(messages)
+			if err != nil {
+				s.logger.Error(err)
+				continue
+			}
+			conn.WriteMessage(websocket.TextMessage, message.Bytes())
+		default:
+		}
+
 	}
 }
 

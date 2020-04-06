@@ -176,9 +176,9 @@ func (s *ServiceScraper) Scrape(window time.Duration) (Stat, error) {
 		return emptyStat, nil
 	}
 	frpc := float64(readyPodsCount)
-
 	sampleSizeF := populationMeanSampleSize(frpc)
-	sampleSize := int(sampleSizeF)
+	sampleSize := int(frpc)
+
 	oldStatCh := make(chan Stat, sampleSize)
 	youngStatCh := make(chan Stat, sampleSize)
 	scrapedPods := &sync.Map{}
@@ -275,6 +275,7 @@ func (s *ServiceScraper) Scrape(window time.Duration) (Stat, error) {
 	// customer pods per scraping. The pod name is set to a unique value, i.e.
 	// scraperPodName so in autoscaler all stats are either from activator or
 	// scraper.
+
 	return Stat{
 		Time:                             time.Now(),
 		PodName:                          scraperPodName,
@@ -283,6 +284,7 @@ func (s *ServiceScraper) Scrape(window time.Duration) (Stat, error) {
 		RequestCount:                     reqCount * frpc,
 		ProxiedRequestCount:              proxiedReqCount * frpc,
 	}, nil
+
 }
 
 // tryScrape runs a single scrape and returns stat if this is a pod that has not been

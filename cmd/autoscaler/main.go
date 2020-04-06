@@ -139,7 +139,10 @@ func main() {
 
 	endpointsInformer := endpointsinformer.Get(ctx)
 
-	collector := asmetrics.NewMetricCollector(statsScraperFactoryFunc(endpointsInformer.Lister()), logger)
+	activatorStatsCh := make(chan asmetrics.StatMessage, statsBufferLen)
+	defer close(activatorStatsCh)
+
+	collector := asmetrics.NewMetricCollector(statsScraperFactoryFunc(endpointsInformer.Lister()), activatorStatsCh, logger)
 	customMetricsAdapter.WithCustomMetrics(asmetrics.NewMetricProvider(collector))
 
 	// Set up scalers.
@@ -152,7 +155,7 @@ func main() {
 	}
 
 	// Set up a statserver.
-	statsServer := statserver.New(statsServerAddr, statsCh, logger)
+	statsServer := statserver.New(statsServerAddr, statsCh, activatorStatsCh, logger)
 
 	// Start watching the configs.
 	if err := cmw.Start(ctx.Done()); err != nil {

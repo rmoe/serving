@@ -17,7 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"errors"
 	"flag"
 	"fmt"
@@ -80,7 +82,8 @@ var (
 )
 
 func statReporter(statSink *websocket.ManagedConnection, stopCh <-chan struct{},
-	statChan <-chan []asmetrics.StatMessage, logger *zap.SugaredLogger) {
+	statChan chan []asmetrics.StatMessage, wsMsgCh <-chan []byte, asStatChan chan []asmetrics.StatMessage,
+	logger *zap.SugaredLogger) {
 	for {
 		select {
 		case sm := <-statChan:
@@ -91,8 +94,16 @@ func statReporter(statSink *websocket.ManagedConnection, stopCh <-chan struct{},
 					}
 				}
 			}()
+		case incomingMsg := <-wsMsgCh:
+			dec := gob.NewDecoder(bytes.NewBuffer(incomingMsg))
+			var sm []asmetrics.StatMessage
+			err := dec.Decode(&sm)
+			if err != nil {
+				logger.Error(err)
+				continue
+			}
+			asStatChan <- sm
 		case <-stopCh:
-			// It's a sending connection, so no drainage required.
 			statSink.Shutdown()
 			return
 		}
@@ -171,6 +182,12 @@ func main() {
 	reqCh := make(chan activatorhandler.ReqEvent, requestCountingQueueLength)
 	defer close(reqCh)
 
+	wsStatCh := make(chan []byte)
+	defer close(wsStatCh)
+
+	asStatCh := make(chan []asmetrics.StatMessage, requestCountingQueueLength)
+	defer close(asStatCh)
+
 	// Start throttler.
 	throttler := activatornet.NewThrottler(ctx, env.PodIP)
 	go throttler.Run(ctx)
@@ -193,11 +210,11 @@ func main() {
 	// Open a WebSocket connection to the autoscaler.
 	autoscalerEndpoint := fmt.Sprintf("ws://%s.%s.svc.%s%s", "autoscaler", system.Namespace(), pkgnet.GetClusterDomainName(), autoscalerPort)
 	logger.Info("Connecting to Autoscaler at ", autoscalerEndpoint)
-	statSink := websocket.NewDurableSendingConnection(autoscalerEndpoint, logger)
-	go statReporter(statSink, ctx.Done(), statCh, logger)
+	statSink := websocket.NewDurableConnection(autoscalerEndpoint, wsStatCh, logger)
+	go statReporter(statSink, ctx.Done(), statCh, wsStatCh, asStatCh, logger)
 
 	// Create and run our concurrency reporter
-	cr := activatorhandler.NewConcurrencyReporter(ctx, env.PodName, reqCh, statCh)
+	cr := activatorhandler.NewConcurrencyReporter(ctx, env.PodName, reqCh, statCh, asStatCh)
 	go cr.Run(ctx.Done())
 
 	// Create activation handler chain
